@@ -59,6 +59,8 @@ using namespace swss;
 #define DEFAULT_SRV6_MY_SID_FUNC_LEN "16"
 #define DEFAULT_SRV6_MY_SID_ARG_LEN "0"
 
+#define MAX_NHG_RECURSION       10
+
 enum srv6_localsid_action {
 	SRV6_LOCALSID_ACTION_UNSPEC				= 0,
 	SRV6_LOCALSID_ACTION_END				= 1,
@@ -112,6 +114,23 @@ enum {
     ROUTE_ENCAP_SRV6_VPN_SID           = 1,
     ROUTE_ENCAP_SRV6_ENCAP_SRC_ADDR    = 2,
 };
+
+/* This is for full nexthop group msg decoding, aligned with encoding part */
+enum {
+    NHA_TYPE					= 1000,
+	NHA_VRF_ID					= 1001,
+	NHA_LABEL_TYPE				= 1002,
+	NHA_SRC						= 1003,
+	NHA_RMAP_SRC				= 1004,
+	NHA_WEIGHT					= 1005,
+	NHA_SRV6_CTX				= 1006,
+	NHA_SRV6_ENCAP_BEHAVIOR		= 1007,
+	NHA_SRV6_NUM_SEGS			= 1008,
+	NHA_SRV6_SEGS				= 1009,
+	NHA_GROUP_DEPENDS			= 1010;
+	NHA_GROUP_DEPENDENTS		= 1011;
+    NHA_GROUP_HASH_VALUE        = 1012;
+}
 
 #define MAX_MULTIPATH_NUM 514
 
@@ -1420,10 +1439,16 @@ void RouteSync::onMsgRaw(struct nlmsghdr *h)
         && (h->nlmsg_type != RTM_DELSRV6LOCALSID)
         && (h->nlmsg_type != RTM_NEWNEXTHOP)
         && (h->nlmsg_type != RTM_DELNEXTHOP)
+        && (h->nlmsg_type != RTM_NEWNEXTHOPFULL)
+        && (h->nlmsg_type != RTM_DELNEXTHOPFULL)
     )
         return;
 
-    if(h->nlmsg_type == RTM_NEWNEXTHOP || h->nlmsg_type == RTM_DELNEXTHOP)
+    if((h->nlmsg_type == RTM_NEWNEXTHOP)
+        || (h->nlmsg_type == RTM_DELNEXTHOP)
+        || (h->nlmsg_type == RTM_NEWNEXTHOPFULL)
+        || (h->nlmsg_type == RTM_DELNEXTHOPFULL)
+    )
     {
         len = (int)(h->nlmsg_len - NLMSG_LENGTH(sizeof(struct nhmsg)));
     }
@@ -1445,7 +1470,13 @@ void RouteSync::onMsgRaw(struct nlmsghdr *h)
         onNextHopMsg(h, len);
         return;
     }
-    
+
+    if(h->nlmsg_type == RTM_NEWNEXTHOPFULL || h->nlmsg_type == RTM_DELNEXTHOPFULL)
+    {
+        onNextHopFullMsg(h, len);
+        return;
+    }
+
     if ((h->nlmsg_type == RTM_NEWSRV6LOCALSID)
         || (h->nlmsg_type == RTM_DELSRV6LOCALSID))
     {
@@ -1734,6 +1765,224 @@ void RouteSync::onRouteMsg(int nlmsg_type, struct nl_object *obj, char *vrf)
                       destipprefix, gw_list.c_str(), intf_list.c_str(),
                       mpls_list.empty() ? "na" : mpls_list.c_str(),
                       weights.empty() ? "na" : weights.c_str());
+    }
+}
+
+/* Handle (Full) Nexthop msg aligned with zebra
+ * @arg nlmsghdr      Netlink messages
+ */
+void RouteSync::onNextHopFullMsg(struct nlmsghdr *h, int len)
+{
+    int nlmsg_type = h->nlmsg_type;
+    uint32_t id = 0, key = 0;
+    uint32_t nh_type = 0, nh_vrf_id = 0, nh_label_type = 0;
+    uint8_t nh_weight = 0, nh_flags = 0;
+    unsigned char addr_family;
+    int32_t ifindex = -1, grp_count_depends = 0, grp_count_dependents = 0;
+    int32_t grp_count_max = MAX_MULTIPATH_NUM * MAX_NHG_RECURSION;
+    string ifname;
+    struct nhmsg *nhm = NULL;
+    struct rtattr *tb[NHA_MAX + 1] = {};
+    union {
+        union g_addr gate;
+        enum blackhole_type bh_type;
+    } nh_gateway = {0};
+    union g_addr nh_src = {0}, nh_rmap_src = {0};
+    char gateway[INET6_ADDRSTRLEN] = "unknown";
+    /* Store srv6 info */
+    uint32_t nh_srv6_seg6local_action = 0;
+    bool has_srv6 = false, has_seg6_segs = false;
+    struct nexthop_srv6 nh_srv6 = {0};
+    struct seg6_seg_stack nh_seg6_segs = {0};
+    std::vector<struct in6_addr> nh_segs;
+
+    nhm = (struct nhmsg *)NLMSG_DATA(h);
+
+    #pragma GCC diagnostic push
+    #pragma GCC diagnostic ignored "-Wcast-align"
+    struct rtattr* rta = NHA_RTA(nhm);
+    #pragma GCC diagnostic pop
+
+    netlink_parse_rtattr(tb, NHA_MAX, rta, len);
+
+    if (!tb[NHA_ID]) {
+        SWSS_LOG_ERROR(
+            "Nexthop group (full) without an ID received from the zebra");
+        return;
+    }
+
+    /* We use the ID key's nhg table for corresponding updates */
+    id = *((uint32_t *)RTA_DATA(tb[NHA_ID]));
+
+    /* Decode nhg hash value from zebra */
+    key = *((uint32_t *)RTA_DATA(tb[NHA_GROUP_HASH_VALUE]));
+
+    addr_family = nhm->nh_family;
+
+    if (nlmsg_type == RTM_NEWNEXTHOPFULL)
+    {
+        /* Group case with depends and dependents info */
+        if (tb[NHA_GROUP_DEPENDS] || tb[NHA_GROUP_DEPENDENTS])
+        {
+            if (tb[NHA_GROUP_DEPENDS])
+            {
+                SWSS_LOG_INFO("New nexthop group full message! To get depends info!");
+
+                struct nh_grp_full *nha_grp_full_depends = (struct nh_grp_full *)RTA_DATA(tb[NHA_GROUP_DEPENDS]);
+                grp_count_depends = (int)(RTA_PAYLOAD(tb[NHA_GROUP_DEPENDS]) / sizeof(*nha_grp_full));
+
+                if (grp_count_depends > grp_count_max)
+                {
+                    SWSS_LOG_ERROR("Nexthop group count depends (%d) exceeds the maximum allowed (%d). Clamping to maximum.",
+                            grp_count_depends, grp_count_max);
+                    grp_count_depends = grp_count_max;
+                }
+
+                vector<tuple<uint32_t, uint8_t, uint32_t>> group_depends(grp_count_depends);
+                for (int i = 0; i < grp_count; i++)
+                {
+                    group_depends[i] = std::make_tuple(nha_grp_full_depends[i].id, nha_grp_full_depends[i].weight,
+                                                    nha_grp_full_depends[i].num_direct);
+                }
+            }
+
+            if (tb[NHA_GROUP_DEPENDENTS])
+            {
+                SWSS_LOG_INFO("New nexthop group full message! To get dependents info!")
+
+                struct nh_grp_full *nha_grp_full_dependents = (struct nh_grp_full *)RTA_DATA(tb[NHA_GROUP_DEPENDENTS]);
+                grp_count_dependents = (int)(RTA_PAYLOAD(tb[NHA_GROUP_DEPENDENTS]) / sizeof(*nha_grp_full));
+
+                if (grp_count_dependents > grp_count_max)
+                {
+                    SWSS_LOG_ERROR("Nexthop group count dependents (%d) exceeds the maximum allowed (%d). Clamping to maximum.",
+                                grp_count_dependents, grp_count_max);
+                    grp_count_dependents = grp_count_max;
+                }
+
+                vector<tuple<uint32_t, uint8_t, uint32_t>> group_dependents(grp_count_dependents);
+                for (int i = 0; i < grp_count; i++)
+                {
+                    group_dependents[i] = std::make_tuple(nha_grp_full_dependents[i].id, nha_grp_full_dependents[i].weight,
+                                                    nha_grp_full_dependents[i].num_direct);
+                }
+            }
+            /* Update the memory mapping table */
+            /* Details are encapsulated such that we do NOT need to check table */
+            addNHGFull(NextHopGroupFull(id, key, group_depends, group_dependents));
+        }
+        else
+        {
+            /* For nexthop singleton, we decode its info of each field */
+            /* nexthop type */
+            if (tb[NHA_TYPE])
+                nh_type = *((uint32_t *)RTA_DATA(tb[NHA_TYPE]));
+
+            /* nexthop vrf_id */
+            if (tb[NHA_VRF_ID])
+                nh_vrf_id = *((uint32_t *)RTA_DATA(tb[NHA_VRF_ID]));
+
+            /* nexthop interface info */
+            if (tb[NHA_OIF])
+            {
+                ifindex = *((int32_t *)RTA_DATA(tb[NHA_OIF]));
+                char if_name[IFNAMSIZ] = {0};
+                if (!getIfName(ifindex, if_name, IFNAMSIZ))
+                    strcpy(if_name, ifname_unknown);
+                ifname = string(if_name);
+                if (ifname == "eth0" || ifname == "docker0")
+                {
+                    SWSS_LOG_DEBUG("Skip routes to interface: %s id [%d]", ifname.c_str(), id);
+                    return;
+                }
+            }
+
+            /* nexthop label type */
+            if (tb[NHA_LABEL_TYPE])
+                nh_label_type = *((uint32_t *)RTA_DATA(tb[NHA_LABEL_TYPE]));
+
+            /* Get nexthop gateway, src and rmap_src according to address family */
+            if (addr_family == AF_INET)
+            {
+                if (tb[NHA_GATEWAY])
+                    memcpy(&nh_gateway.gate.ipv4, RTA_DATA(tb[NHA_GATEWAY]), sizeof(in_addr));
+
+                if (tb[NHA_SRC])
+                    memcpy(&nh_src.ipv4, RTA_DATA(tb[NHA_SRC]), sizeof(in_addr));
+
+                if (tb[NHA_RMAP_SRC])
+                    memcpy(&nh_rmap_src.ipv4, RTA_DATA(tb[NHA_RMAP_SRC]), sizeof(in_addr));
+            }
+            else if (addr_family == AF_INET6)
+            {
+                if (tb[NHA_GATEWAY])
+                    memcpy(&nh_gateway.gate.ipv6, RTA_DATA(tb[NHA_GATEWAY]), sizeof(in6_addr));
+
+                if (tb[NHA_SRC])
+                    memcpy(&nh_src.ipv6, RTA_DATA(tb[NHA_SRC]), sizeof(in6_addr));
+
+                if (tb[NHA_RMAP_SRC])
+                    memcpy(&nh_rmap_src.ipv6, RTA_DATA(tb[NHA_RMAP_SRC]), sizeof(in6_addr));
+            }
+            else
+            {
+                SWSS_LOG_ERROR("Unexpected nexthop address family");
+                return;
+            }
+
+            /* nexthop weight */
+            if (tb[NHA_WEIGHT])
+                nh_weight = *((uint8_t *)RTA_DATA(tb[NHA_WEIGHT]));
+
+            /* set onlink flag */
+            if (nhm->nh_flags & NEXTHOP_FLAG_ONLINK)
+                nh_flags |= NEXTHOP_FLAG_ONLINK;
+
+            /* nexthop srv6 info */
+            /* srv6 action */
+            if (tb[SEG6_LOCAL_ACTION])
+            {
+                has_srv6 = true;
+                nh_srv6_seg6local_action = *((uint32_t *)RTA_DATA(tb[SEG6_LOCAL_ACTION]));
+            }
+
+            /* srv6 context */
+            if (tb[NHA_SRV6_CTX])
+                memcpy(&nh_seg6local_ctx, RTA_DATA(tb[NHA_SRV6_CTX]), sizeof(struct seg6local_context));
+
+            /* srv6 segments */
+            /* srv6 headend behavior */
+            if (tb[NHA_SEV6_ENCAP_BEHAVIOR])
+            {
+                has_seg6_segs = true;
+                nh_seg6_segs.encap_behavior = *((uint32_t *)RTA_DATA(tb[NHA_SRV6_ENCAP_BEHAVIOR]));
+            }
+
+            /* number of srv6 segs */
+            if (tb[NHA_SRV6_NUM_SEGS])
+                nh_seg6_segs.num_segs = *((uint8_t *)RTA_DATA(tb[NHA_SRV6_NUM_SEGS]));
+
+            /* NHA_SRV6_SEGS indicates num_segs > 0 */
+            if (tb[NHA_SRV6_SEGS])
+            {
+                nh_segs.resize(nh_seg6_segs.num_segs);
+                memcpy(nh_segs.data(), RTA_DATA(tb[NHA_SRV6_SEGS]), nh_seg6_segs.num_segs * sizeof(struct in6_addr));
+            }
+
+
+            /* Construct the NextHopGroupFull and update the memory */
+            /* to update the memory mapping table */
+            /* Details are encapsulated such that we do NOT need to check table */
+            addNHGFull(NextHopGroupFull(id, key, nh_type, nh_vrf_id, ifindex, nh_label_type,
+                                 nh_gateway, nh_src, nh_rmap_src, nh_weight, nh_flags,
+                                 has_srv6, has_seg6_segs,
+                                 nh_srv6, nh_seg6_segs, nh_segs));
+        }
+    }
+    else if (nlmsg_type == RTM_DELNEXTHOPFULL)
+    {
+        SWSS_LOG_DEBUG("NextHopGroupFull del event: %d", id);
+        delNHGFull(id);
     }
 }
 

@@ -17,6 +17,8 @@
 
 #define RTM_NEWSRV6LOCALSID		1000
 #define RTM_DELSRV6LOCALSID		1001
+#define RTM_NEWNEXTHOPFULL      5000
+#define RTM_DELNEXTHOPFULL      5001
 
 namespace swss {
 
