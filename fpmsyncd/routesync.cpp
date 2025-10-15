@@ -1683,8 +1683,6 @@ void RouteSync::onSrv6VpnRouteMsg(struct nlmsghdr *h, int len)
         return ;
     }
 
-    bool warmRestartInProgress = m_warmStartHelper.inProgress();
-
     if (nlmsg_type == RTM_DELSRV6VPNROUTE)
     {
         SWSS_LOG_INFO("RouteTable del msg: %s", routeTableKey);
